@@ -1,101 +1,113 @@
 # Freelance Careers Advisor (fa-bot)
 
-Bot Telegram personale che cerca in rete offerte di lavoro freelance compatibili con il tuo CV
-e te le invia agli orari che scegli (di default una volta al giorno, alle 9:00).
+A personal Telegram bot that searches the web for freelance job offers matching your CV
+and sends them to you at the times you choose (by default once a day, at 9:00).
 
-## Come funziona
+The bot's interface and messages are in Italian.
 
-1. **CV → profilo**: invii il CV al bot (docx, pdf, txt). Claude ne estrae un profilo
-   (ruoli, competenze, settori, keyword di ricerca). Puoi affinarlo con `/preferenze`.
-2. **Fonti strutturate** (gratuite, link diretto e dati affidabili):
+## How it works
 
-   | Fonte | Come | Chiave |
+1. **CV → profile**: you send your CV to the bot (docx, pdf, txt). Claude extracts a profile from it
+   (roles, skills, industries, search keywords). You can refine it with `/preferenze`.
+2. **Structured sources** (free, with direct links and reliable data):
+
+   | Source | How | Key |
    |---|---|---|
-   | iProgrammatori | feed RSS ufficiale + pagina annuncio (contratto, modalità, retribuzione) | no |
-   | Remotive | API pubblica, offerte remote | no |
-   | Arbeitnow | API pubblica, offerte remote in Europa | no |
-   | Adzuna | API, Italia | sì, gratuita (`ADZUNA_APP_ID`, `ADZUNA_APP_KEY`) |
-   | Jooble | API, Italia | sì, gratuita (`JOOBLE_API_KEY`) |
+   | iProgrammatori | official RSS feed + job page (contract, work mode, pay) | no |
+   | Remotive | public API, remote jobs | no |
+   | Arbeitnow | public API, remote jobs in Europe | no |
+   | Adzuna | API, Italy | yes, free (`ADZUNA_APP_ID`, `ADZUNA_APP_KEY`) |
+   | Jooble | API, Italy | yes, free (`JOOBLE_API_KEY`) |
 
-   Il bot tiene solo gli annunci recenti (ultime 3 settimane) che contengono i termini del tuo profilo
-   (es. react, frontend, smart tv) e scarta quelli con contratto solo da dipendente.
-   Claude valuta gli altri rispetto al CV.
-3. **Ricerca web** (opzionale, `WEB_SEARCH_ENABLED`): Claude cerca anche su LinkedIn, Malt,
-   pagine carriere di agenzie ecc., apre le pagine per verificarle e le marca ✅ verificate o
-   ⚠️ non verificate (LinkedIn e Indeed non si lasciano aprire).
-4. **Filtri**: il bot scarta le offerte non freelance, quelle solo in sede fuori Milano,
-   quelle con rate chiaramente sotto il minimo e quelle con match < 55%.
-5. **Ordinamento**: area (Milano → Italia → Europa), poi durata (brevi → lunghe → medie),
-   poi tipo di azienda (agenzie di comunicazione → medie/grandi imprese → consulenza), poi match.
-6. **Niente doppioni**: le offerte già inviate non vengono riproposte. Con 👎 scarti un'offerta
-   (le ricerche successive evitano offerte simili), con ⭐ la salvi.
+   The bot keeps only recent postings (last 3 weeks) that contain terms from your profile
+   (e.g. react, frontend, smart tv) and drops those offering employee-only contracts.
+   Claude assesses the rest against your CV.
+3. **Web search** (optional, `WEB_SEARCH_ENABLED`): Claude also searches LinkedIn, Malt,
+   agency career pages and so on, opens the pages to verify them and marks each offer as
+   ✅ verified or ⚠️ unverified (LinkedIn and Indeed don't allow their pages to be opened).
+4. **Filters**: the bot drops offers that aren't freelance, on-site-only offers outside Milan,
+   offers clearly below the minimum rate, and offers with a match below 55%.
+5. **Sorting**: by area (Milan → rest of Italy → Europe), then duration (short → long → medium),
+   then company type (communication agencies → mid-size/large companies → consulting firms), then match.
+6. **No duplicates**: offers already sent are never repeated. Tap 👎 to dismiss an offer
+   (later searches avoid similar ones), or ⭐ to save it.
 
 ## Setup
 
-1. Crea il bot con [@BotFather](https://t.me/BotFather) (`/newbot`) e copia il token.
-2. Crea una chiave API su [console.anthropic.com](https://console.anthropic.com).
-3. Configura l'ambiente:
+1. Create the bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy the token.
+2. Create an API key at [console.anthropic.com](https://console.anthropic.com).
+3. Set up the environment:
 
    ```bash
    cp .env.example .env
    ```
 
-   Compila `TELEGRAM_BOT_TOKEN` e `ANTHROPIC_API_KEY` in `.env`.
-4. Avvia il bot:
+   Fill in `TELEGRAM_BOT_TOKEN` and `ANTHROPIC_API_KEY` in `.env`.
+4. Start the bot:
 
    ```bash
    uv run python -m fa_bot
    ```
 
-5. Su Telegram apri il bot, invia `/start` e poi il tuo CV come file.
-   Il primo utente che fa `/start` diventa il proprietario: il bot non risponde a nessun altro.
-   In alternativa imposta `TELEGRAM_OWNER_ID` in `.env`.
+5. In Telegram, open the bot, send `/start` and then your CV as a file.
+   The first user to send `/start` becomes the owner, and the bot ignores everyone else.
+   Alternatively, set `TELEGRAM_OWNER_ID` in `.env`.
 
-### Avvio automatico sul Mac
+### Auto-start on macOS
 
 ```bash
 ./scripts/install-launchd.sh
 ```
 
-Il bot parte al login e si riavvia da solo se si chiude. I log sono in `logs/bot.log`.
-Se il Mac è in stop all'orario previsto, l'invio viene recuperato entro un'ora dal risveglio,
-altrimenti salta. Per disinstallare: `./scripts/uninstall-launchd.sh`.
+The bot starts at login and restarts on its own if it stops. The application log is in
+`logs/fa_bot.log`, and launchd's output goes to `logs/bot.log`.
+If the Mac is asleep at a scheduled time, the run is caught up if it wakes within an hour;
+otherwise it is skipped. To uninstall: `./scripts/uninstall-launchd.sh`.
 
-## Comandi
+## Commands
 
-| Comando | Cosa fa |
+| Command | What it does |
 |---|---|
-| `/start` | Configurazione iniziale |
-| `/cerca` | Ricerca immediata |
-| `/orari [9 14 18]` | Mostra o cambia gli orari di invio |
-| `/rate [250 300]` | Mostra o cambia il rate giornaliero target |
-| `/cv` | Mostra il profilo estratto. Invia un nuovo file per aggiornarlo |
-| `/preferenze <testo>` | Aggiunge un'indicazione (es. "anche ruoli da Scrum Master") |
-| `/preferenze_reset` | Cancella le indicazioni |
-| `/filtri` | Riepilogo dei criteri |
-| `/salvati` | Offerte salvate con ⭐ |
-| `/pausa`, `/riprendi` | Sospende o riattiva gli invii automatici |
+| `/start` | Initial setup |
+| `/cerca` | Search now |
+| `/orari [9 14 18]` | Show or change the delivery times |
+| `/rate [250 300]` | Show or change the target daily rate |
+| `/cv` | Show the extracted profile. Send a new file to update it |
+| `/preferenze <text>` | Add a guideline (e.g. "anche ruoli da Scrum Master") |
+| `/preferenze_reset` | Clear the guidelines |
+| `/filtri` | Summary of the search criteria |
+| `/salvati` | Offers saved with ⭐ |
+| `/pausa`, `/riprendi` | Pause or resume automatic deliveries |
 
-## Costi
+## Costs
 
-Ogni ricerca usa la web search (max `WEB_SEARCH_MAX_USES` ricerche, 10 $ ogni 1000) e i token
-dei risultati letti, che sono la voce principale. Il prompt caching è attivo: i passaggi interni
-della ricerca rileggono il contesto dalla cache al 10% del prezzo.
+Assessing postings from the structured sources costs only Claude tokens. The web search adds
+search fees (up to `WEB_SEARCH_MAX_USES` searches, $10 per 1,000) and the tokens of the results
+it reads, which make up most of its cost. Prompt caching is enabled: each internal step of the
+search re-reads the earlier context from the cache at 10% of the price.
 
-Misurato con Opus 5.5: valutazione delle fonti strutturate ~0,15 $ e ricerca web ~0,32 $,
-circa 0,50 $ a giro in tutto (~15 $/mese con un invio al giorno). Per spendere ancora meno:
+Measured with Opus 5.5: about $0.15 to assess the structured sources and about $0.32 for the
+web search, roughly $0.50 per run in total (~$15/month with one delivery a day). To spend less:
 
-- `WEB_SEARCH_ENABLED=false` (solo fonti strutturate, ~0,15 $ a giro, ~5 $/mese);
-- `CLAUDE_MODEL=claude-sonnet-5-5` in `.env` (prezzo circa dimezzato);
-- abbassa `WEB_SEARCH_MAX_USES` (es. 5).
+- `WEB_SEARCH_ENABLED=false` (structured sources only, ~$0.15 per run, ~$5/month);
+- `CLAUDE_MODEL=claude-sonnet-5-5` in `.env` (roughly half the price);
+- lower `WEB_SEARCH_MAX_USES` (e.g. 5).
 
-Il consumo di ogni giro è nei log (`input`, `cache_write`, `cache_read`, `output`) e nella console Anthropic.
+The usage of each run is in the logs (`input`, `cache_write`, `cache_read`, `output`) and in the Anthropic Console.
 
-## Sviluppo
+## Development
 
 ```bash
 uv run pytest
 ```
 
-Struttura: `src/fa_bot/` contiene `bot.py` (Telegram), `search.py` (ricerca e ordinamento),
-`cv.py` (analisi del CV), `db.py` (SQLite in `data/`), `formatting.py` (messaggi) e `models.py`.
+To run a full search without Telegram and see what happens at each step
+(nothing is marked as sent):
+
+```bash
+uv run python scripts/debug_search.py
+```
+
+Layout: `src/fa_bot/` contains `bot.py` (Telegram), `sources.py` (feeds and APIs),
+`scoring.py` (Claude assessment of postings), `search.py` (web search, filters and sorting),
+`cv.py` (CV analysis), `db.py` (SQLite in `data/`), `formatting.py` (messages) and `models.py`.
