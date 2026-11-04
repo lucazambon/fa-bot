@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from html import escape
 
+from .config import MIN_MATCH_SCORE
 from .models import Job, Profile
+from .stats import RunStats
 
 AREA_LABEL = {"milano": "📍 Milano", "italia": "🇮🇹 Italia", "europa": "🇪🇺 Europa", "altro": "🌍 Altro"}
 MODE_LABEL = {"remoto": "🏠 Remoto", "ibrido": "🔀 Ibrido", "in_sede": "🏢 In sede", "non_indicato": "❔ Modalità n.d."}
@@ -82,6 +84,95 @@ def profile_message(profile: Profile, preferences: list[str]) -> str:
     if preferences:
         text += "\n\n<b>Tue indicazioni:</b>\n" + "\n".join(f"• {escape(p)}" for p in preferences)
     return text
+
+
+def fmt_duration(seconds: float) -> str:
+    sec = round(seconds)
+    if sec < 60:
+        return f"{sec} s"
+    minutes, rest = divmod(sec, 60)
+    return f"{minutes} min {rest:02d} s"
+
+
+def fmt_tokens(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}".replace(".", ",") + "k"
+    return f"{n / 1_000_000:.2f}".replace(".", ",") + "M"
+
+
+def fmt_eur(value: float) -> str:
+    if value < 0.005:
+        return "meno di 0,01 €"
+    return f"{value:.2f}".replace(".", ",") + " €"
+
+
+def fmt_usd(value: float) -> str:
+    return "$" + f"{value:.2f}"
+
+
+def run_summary(stats: RunStats) -> str:
+    """Riepilogo del lavoro di selezione di un giro: fonti, filtri, fasi, tempo, token e costi."""
+    c = stats.counts
+    lines = ["📊 <b>Lavoro di selezione</b>", "", "<b>🔎 Fonti analizzate</b>"]
+    for name, src in stats.sources.items():
+        if src.error:
+            lines.append(f"• {escape(name)}: non disponibile")
+        else:
+            lines.append(f"• {escape(name)}: {src.scanned} annunci letti → {src.relevant} pertinenti")
+    web = stats.phase_named("Ricerca web")
+    if web:
+        lines.append(
+            f"• Ricerca web: {web.usage.web_searches} ricerche, {web.usage.web_fetches} pagine aperte"
+            f" → {c['web_found']} offerte trovate"
+        )
+
+    lines += ["", "<b>🧹 Selezione</b>"]
+    skipped = [
+        f"{c[key]} {label}"
+        for key, label in (("duplicates", "doppioni"), ("known", "già inviate"), ("employee_only", "solo da dipendente"))
+        if c[key]
+    ]
+    line = f"• Dalle fonti: {c['source_total']} annunci pertinenti → {c['to_assess']} da valutare"
+    lines.append(line + (f" (scartati: {', '.join(skipped)})" if skipped else ""))
+    lines.append(f"• Valutati da Claude: {c['to_assess'] + c['web_found']}")
+    dropped = [
+        f"{c[key]} {label}"
+        for key, label in (
+            ("not_freelance", "non freelance"),
+            ("below_match", f"match sotto {MIN_MATCH_SCORE}%"),
+            ("on_site", "solo in sede fuori Milano"),
+            ("below_rate", "rate sotto il minimo"),
+            ("repeated", "già proposte"),
+        )
+        if c[key]
+    ]
+    if dropped:
+        lines.append(f"• Scartati: {', '.join(dropped)}")
+    lines.append(f"• <b>Proposte: {c['shown']}</b>")
+
+    lines += ["", "<b>⚙️ Fasi</b>"]
+    for ph in stats.phases:
+        cost = "gratis" if ph.cost_usd == 0 else fmt_eur(stats.eur(ph.cost_usd))
+        lines.append(f"• {escape(ph.label)}: {fmt_duration(ph.seconds)} · {cost}")
+
+    u = stats.usage
+    lines += [
+        "",
+        f"⏱ <b>Tempo totale</b>: {fmt_duration(stats.elapsed)}",
+        f"🔤 <b>Token</b>: {fmt_tokens(u.total_tokens)} "
+        f"({fmt_tokens(u.input)} input · {fmt_tokens(u.cache_write)} scritti in cache · "
+        f"{fmt_tokens(u.cache_read)} letti da cache · {fmt_tokens(u.output)} output)",
+        f"💶 <b>Costo</b>: {fmt_eur(stats.cost_eur)} ({fmt_usd(stats.cost_usd)})",
+    ]
+    if stats.search_fee_usd:
+        lines.append(
+            f"   token {fmt_eur(stats.eur(stats.token_cost_usd))} · "
+            f"ricerche web {fmt_eur(stats.eur(stats.search_fee_usd))}"
+        )
+    lines.append(f"<i>Stima da listino, cambio 1 $ = {str(stats.usd_eur).replace('.', ',')} €</i>")
+    return "\n".join(lines)
 
 
 HELP = """\

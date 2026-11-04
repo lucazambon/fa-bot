@@ -18,6 +18,8 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
+from .stats import RunStats, SourceStat
+
 log = logging.getLogger(__name__)
 
 USER_AGENT = "fa-bot/0.1 (bot personale di ricerca offerte freelance)"
@@ -116,7 +118,7 @@ def parse_iprog_detail(page_html: str) -> tuple[dict[str, str], str]:
     return details, desc
 
 
-async def fetch_iprogrammatori(client: httpx.AsyncClient, terms: list[str]) -> list[Posting]:
+async def fetch_iprogrammatori(client: httpx.AsyncClient, terms: list[str]) -> tuple[int, list[Posting]]:
     resp = await client.get(IPROG_FEED)
     resp.raise_for_status()
     feed = parse_iprog_feed(resp.text)
@@ -135,16 +137,17 @@ async def fetch_iprogrammatori(client: httpx.AsyncClient, terms: list[str]) -> l
         except httpx.HTTPError as exc:
             log.warning("iProgrammatori: dettaglio non letto %s (%s)", p.url, exc)
         await asyncio.sleep(1)  # cortesia verso il sito
-    return relevant[:IPROG_DETAIL_LIMIT]
+    return len(feed), relevant[:IPROG_DETAIL_LIMIT]
 
 
 # --- Remotive ------------------------------------------------------------
 
-async def fetch_remotive(client: httpx.AsyncClient, terms: list[str]) -> list[Posting]:
+async def fetch_remotive(client: httpx.AsyncClient, terms: list[str]) -> tuple[int, list[Posting]]:
     resp = await client.get("https://remotive.com/api/remote-jobs", params={"category": "software-dev"})
     resp.raise_for_status()
     out = []
-    for j in resp.json().get("jobs", []):
+    all_jobs = resp.json().get("jobs", [])
+    for j in all_jobs:
         loc = j.get("candidate_required_location") or ""
         if loc and not re.search(r"worldwide|europe|emea|italy|anywhere|cet", loc, re.I):
             continue
@@ -161,17 +164,20 @@ async def fetch_remotive(client: httpx.AsyncClient, terms: list[str]) -> list[Po
         if is_recent(p) and matches_terms(p, terms):
             out.append(p)
     log.info("Remotive: %d pertinenti", len(out))
-    return out
+    return len(all_jobs), out
 
 
 # --- Arbeitnow -----------------------------------------------------------
 
-async def fetch_arbeitnow(client: httpx.AsyncClient, terms: list[str]) -> list[Posting]:
+async def fetch_arbeitnow(client: httpx.AsyncClient, terms: list[str]) -> tuple[int, list[Posting]]:
     out = []
+    scanned = 0
     for page in (1, 2, 3):
         resp = await client.get("https://www.arbeitnow.com/api/job-board-api", params={"page": page})
         resp.raise_for_status()
-        for j in resp.json().get("data", []):
+        data = resp.json().get("data", [])
+        scanned += len(data)
+        for j in data:
             if not j.get("remote"):
                 continue
             p = Posting(
@@ -187,16 +193,19 @@ async def fetch_arbeitnow(client: httpx.AsyncClient, terms: list[str]) -> list[P
             if is_recent(p) and matches_terms(p, terms):
                 out.append(p)
     log.info("Arbeitnow: %d pertinenti", len(out))
-    return out
+    return scanned, out
 
 
 # --- Adzuna (chiave gratuita: developer.adzuna.com) -----------------------
 
-async def fetch_adzuna(client: httpx.AsyncClient, terms: list[str], queries: list[str]) -> list[Posting]:
+async def fetch_adzuna(
+    client: httpx.AsyncClient, terms: list[str], queries: list[str]
+) -> tuple[int, list[Posting]] | None:
     app_id, app_key = os.getenv("ADZUNA_APP_ID"), os.getenv("ADZUNA_APP_KEY")
     if not (app_id and app_key):
-        return []
+        return None  # fonte non configurata
     out = []
+    scanned = 0
     for q in queries[:4]:
         resp = await client.get(
             "https://api.adzuna.com/v1/api/jobs/it/search/1",
@@ -206,7 +215,9 @@ async def fetch_adzuna(client: httpx.AsyncClient, terms: list[str], queries: lis
             },
         )
         resp.raise_for_status()
-        for j in resp.json().get("results", []):
+        results = resp.json().get("results", [])
+        scanned += len(results)
+        for j in results:
             lo, hi = j.get("salary_min"), j.get("salary_max")
             p = Posting(
                 source="Adzuna",
@@ -224,20 +235,25 @@ async def fetch_adzuna(client: httpx.AsyncClient, terms: list[str], queries: lis
             if matches_terms(p, terms):
                 out.append(p)
     log.info("Adzuna: %d pertinenti", len(out))
-    return out
+    return scanned, out
 
 
 # --- Jooble (chiave gratuita: jooble.org/api/about) -----------------------
 
-async def fetch_jooble(client: httpx.AsyncClient, terms: list[str], queries: list[str]) -> list[Posting]:
+async def fetch_jooble(
+    client: httpx.AsyncClient, terms: list[str], queries: list[str]
+) -> tuple[int, list[Posting]] | None:
     key = os.getenv("JOOBLE_API_KEY")
     if not key:
-        return []
+        return None  # fonte non configurata
     out = []
+    scanned = 0
     for q in queries[:4]:
         resp = await client.post(f"https://it.jooble.org/api/{key}", json={"keywords": q, "location": "Italia"})
         resp.raise_for_status()
-        for j in resp.json().get("jobs", []):
+        found = resp.json().get("jobs", [])
+        scanned += len(found)
+        for j in found:
             p = Posting(
                 source="Jooble",
                 title=clean_html(j.get("title", "")),
@@ -251,7 +267,7 @@ async def fetch_jooble(client: httpx.AsyncClient, terms: list[str], queries: lis
             if is_recent(p) and matches_terms(p, terms):
                 out.append(p)
     log.info("Jooble: %d pertinenti", len(out))
-    return out
+    return scanned, out
 
 
 def _iso(value: str | None) -> datetime | None:
@@ -264,7 +280,9 @@ def _iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-async def collect_postings(terms: list[str], queries: list[str]) -> list[Posting]:
+async def collect_postings(
+    terms: list[str], queries: list[str], stats: RunStats | None = None
+) -> list[Posting]:
     """Interroga tutte le fonti in parallelo; una fonte che fallisce non blocca le altre."""
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True
@@ -281,6 +299,13 @@ async def collect_postings(terms: list[str], queries: list[str]) -> list[Posting
     for name, res in zip(tasks, results):
         if isinstance(res, BaseException):
             log.warning("Fonte %s non disponibile: %s", name, res)
+            if stats:
+                stats.sources[name] = SourceStat(error=str(res))
+        elif res is None:
+            continue  # fonte non configurata (manca la chiave)
         else:
-            postings.extend(res)
+            scanned, found = res
+            postings.extend(found)
+            if stats:
+                stats.sources[name] = SourceStat(scanned=scanned, relevant=len(found))
     return postings

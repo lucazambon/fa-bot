@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from .db import Store, job_key, posting_key
 from .models import Job, JobList, Profile
 from .scoring import assess_postings
 from .sources import FREELANCE_RE, Posting, collect_postings
+from .stats import RunStats
 
 log = logging.getLogger(__name__)
 
@@ -120,22 +123,25 @@ def sort_key(job: Job) -> tuple:
     )
 
 
-def filter_and_sort(jobs: list[Job], rate_min: int) -> list[Job]:
+def filter_and_sort(jobs: list[Job], rate_min: int, reasons: Counter | None = None) -> list[Job]:
+    """Applica i filtri e ordina. Se `reasons` è dato, ci conta il primo motivo di scarto di ogni offerta."""
+    reasons = reasons if reasons is not None else Counter()
     kept = []
     for j in jobs:
-        if j.match_score < MIN_MATCH_SCORE:
-            continue
-        if j.work_mode == "in_sede" and j.area != "milano":
-            continue
         top_rate = j.daily_rate_max or j.daily_rate_min
-        if top_rate is not None and top_rate < rate_min:
-            continue
-        kept.append(j)
+        if j.match_score < MIN_MATCH_SCORE:
+            reasons["below_match"] += 1
+        elif j.work_mode == "in_sede" and j.area != "milano":
+            reasons["on_site"] += 1
+        elif top_rate is not None and top_rate < rate_min:
+            reasons["below_rate"] += 1
+        else:
+            kept.append(j)
     return sorted(kept, key=sort_key)
 
 
 async def _run_web_search(
-    client: AsyncAnthropic, model: str, prompt: str, max_uses: int, fetch_max_uses: int
+    client: AsyncAnthropic, model: str, prompt: str, max_uses: int, fetch_max_uses: int, stats: RunStats
 ) -> str:
     messages: list[dict] = [{"role": "user", "content": prompt}]
     tools = [
@@ -159,40 +165,38 @@ async def _run_web_search(
         },
     ]
     response = None
-    for _ in range(MAX_CONTINUATIONS + 1):
-        async with client.beta.messages.stream(
-            model=model,
-            max_tokens=64000,
-            system=SEARCH_SYSTEM,
-            messages=messages,
-            tools=tools,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "medium"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            # Caching automatico: con la web search attiva il server aggiunge un punto di cache dopo
-            # ogni risultato, così ogni passaggio del ciclo rilegge il contesto precedente al 10% del prezzo.
-            cache_control={"type": "ephemeral"},
-        ) as stream:
-            response = await stream.get_final_message()
-        if response.stop_reason != "pause_turn":
-            break
-        # Il loop lato server ha raggiunto il limite di iterazioni: si riprende da dove si è fermato.
-        messages = [messages[0], {"role": "assistant", "content": response.content}]
+    with stats.phase("Ricerca web", model) as ph:
+        for _ in range(MAX_CONTINUATIONS + 1):
+            async with client.beta.messages.stream(
+                model=model,
+                max_tokens=64000,
+                system=SEARCH_SYSTEM,
+                messages=messages,
+                tools=tools,
+                thinking={"type": "adaptive"},
+                output_config={"effort": "medium"},
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                # Caching automatico: con la web search attiva il server aggiunge un punto di cache dopo
+                # ogni risultato, così ogni passaggio del ciclo rilegge il contesto precedente al 10% del prezzo.
+                cache_control={"type": "ephemeral"},
+            ) as stream:
+                response = await stream.get_final_message()
+            ph.add_usage(response.usage)
+            if response.stop_reason != "pause_turn":
+                break
+            # Il loop lato server ha raggiunto il limite di iterazioni: si riprende da dove si è fermato.
+            messages = [messages[0], {"role": "assistant", "content": response.content}]
 
     if response is None or response.stop_reason == "refusal":
         raise RuntimeError("La ricerca è stata rifiutata dal modello.")
     report = report_with_sources(response.content)
-    stu = response.usage.server_tool_use
+    u = ph.usage
     log.info(
-        "Ricerca completata: stop=%s ricerche=%s pagine_aperte=%s caratteri=%d "
+        "Ricerca completata: stop=%s ricerche=%d pagine_aperte=%d caratteri=%d "
         "input=%d cache_write=%d cache_read=%d output=%d",
-        response.stop_reason,
-        getattr(stu, "web_search_requests", "?"), getattr(stu, "web_fetch_requests", "?"), len(report),
-        response.usage.input_tokens,
-        response.usage.cache_creation_input_tokens or 0,
-        response.usage.cache_read_input_tokens or 0,
-        response.usage.output_tokens,
+        response.stop_reason, u.web_searches, u.web_fetches, len(report),
+        u.input, u.cache_write, u.cache_read, u.output,
     )
     return report
 
@@ -215,14 +219,16 @@ def report_with_sources(content: list) -> str:
     return "".join(parts).strip()
 
 
-async def _extract_jobs(client: AsyncAnthropic, model: str, report: str) -> list[Job]:
-    response = await client.messages.parse(
-        model=model,
-        max_tokens=16000,
-        output_config={"effort": "low"},
-        messages=[{"role": "user", "content": EXTRACT_PROMPT.format(report=report)}],
-        output_format=JobList,
-    )
+async def _extract_jobs(client: AsyncAnthropic, model: str, report: str, stats: RunStats) -> list[Job]:
+    with stats.phase("Estrazione dati", model) as ph:
+        response = await client.messages.parse(
+            model=model,
+            max_tokens=16000,
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": EXTRACT_PROMPT.format(report=report)}],
+            output_format=JobList,
+        )
+        ph.add_usage(response.usage)
     if response.parsed_output is None:
         log.warning("Estrazione fallita: stop=%s", response.stop_reason)
         return []
@@ -237,17 +243,25 @@ def _is_employee_only(p: Posting) -> bool:
     return not FREELANCE_RE.search(contract)
 
 
-async def _ensure_match_terms(client: AsyncAnthropic, store: Store, model: str, profile: Profile) -> Profile:
+async def _ensure_match_terms(
+    client: AsyncAnthropic, store: Store, model: str, profile: Profile, stats: RunStats
+) -> Profile:
     if profile.match_terms:
         return profile
     content = store.get("cv_content")
     if content:
         log.info("Profilo senza match_terms: lo rigenero dal CV")
-        profile = await build_profile(client, model, content, store.get("preferences", []))
+        profile = await build_profile(client, model, content, store.get("preferences", []), stats)
         store.set_profile(profile)
     if not profile.match_terms:
         profile.match_terms = [s.lower() for s in profile.core_skills]
     return profile
+
+
+@dataclass
+class SearchResult:
+    jobs: list[tuple[str, Job]]
+    stats: RunStats
 
 
 async def find_jobs(
@@ -259,12 +273,14 @@ async def find_jobs(
     max_jobs: int = 10,
     debug_dir: Path | None = None,
     web_search: bool = True,
-) -> list[tuple[str, Job]]:
-    """Esegue una ricerca completa e restituisce solo le offerte nuove, ordinate, con la loro chiave."""
+    usd_eur: float = 0.92,
+) -> SearchResult:
+    """Esegue una ricerca completa: offerte nuove, ordinate, più la contabilità di tempi e costi."""
+    stats = RunStats(usd_eur=usd_eur)
     profile = store.get_profile()
     if profile is None:
         raise RuntimeError("Nessun CV caricato. Inviami il tuo CV (docx o pdf) per iniziare.")
-    profile = await _ensure_match_terms(client, store, model, profile)
+    profile = await _ensure_match_terms(client, store, model, profile, stats)
 
     rate_min = store.get("rate_min")
     rate_max = store.get("rate_max")
@@ -272,16 +288,26 @@ async def find_jobs(
     profile_text = _profile_text(profile)
 
     # 1) Fonti strutturate (feed e API): gratuite, dati affidabili con link diretto.
-    postings = await collect_postings(profile.match_terms, profile.search_keywords_it[:2] + profile.search_keywords_en[:2])
+    with stats.phase("Fonti strutturate"):
+        postings = await collect_postings(
+            profile.match_terms, profile.search_keywords_it[:2] + profile.search_keywords_en[:2], stats
+        )
     unique: dict[str, Posting] = {}
     for p in postings:
         key = posting_key(p.title, p.company)
-        if key in unique or store.is_known(key) or _is_employee_only(p):
-            continue
-        unique[key] = p
-    log.info("Fonti strutturate: %d annunci, %d nuovi da valutare", len(postings), len(unique))
+        if key in unique:
+            stats.counts["duplicates"] += 1
+        elif store.is_known(key):
+            stats.counts["known"] += 1
+        elif _is_employee_only(p):
+            stats.counts["employee_only"] += 1
+        else:
+            unique[key] = p
     candidates = list(unique.values())
-    jobs = await assess_postings(client, model, candidates, profile_text, rate_min, rate_max, prefs)
+    stats.counts["source_total"] = len(postings)
+    stats.counts["to_assess"] = len(candidates)
+    log.info("Fonti strutturate: %d annunci, %d nuovi da valutare", len(postings), len(candidates))
+    jobs = await assess_postings(client, model, candidates, profile_text, rate_min, rate_max, prefs, stats)
 
     # 2) Ricerca web: integra con agenzie, pagine carriere e piattaforme non coperte dalle fonti.
     if web_search:
@@ -297,14 +323,16 @@ async def find_jobs(
             dismissed=_bullets(dismissed),
             max_jobs=max_jobs,
         )
-        report = await _run_web_search(client, model, prompt, max_uses, fetch_max_uses)
+        report = await _run_web_search(client, model, prompt, max_uses, fetch_max_uses, stats)
         if debug_dir:
             debug_dir.mkdir(parents=True, exist_ok=True)
             (debug_dir / "last_report.md").write_text(report, encoding="utf-8")
         if report:
-            jobs += await _extract_jobs(client, model, report)
+            found = await _extract_jobs(client, model, report, stats)
+            stats.counts["web_found"] = len(found)
+            jobs += found
 
-    kept = filter_and_sort(jobs, rate_min)
+    kept = filter_and_sort(jobs, rate_min, stats.counts)
     log.info("Offerte: valutate=%d dopo_filtri=%d", len(jobs), len(kept))
     for j in jobs:
         if j not in kept:
@@ -316,7 +344,15 @@ async def find_jobs(
     for job in kept:
         key = job_key(job)
         if key in seen_now or store.is_known(key):
+            stats.counts["repeated"] += 1
             continue
         seen_now.add(key)
         fresh.append((key, job))
-    return fresh[:max_jobs]
+    fresh = fresh[:max_jobs]
+    stats.counts["shown"] = len(fresh)
+    stats.finish()
+    log.info(
+        "Giro concluso in %.0f s: %d token, costo %.3f $ (%.3f €)",
+        stats.elapsed, stats.usage.total_tokens, stats.cost_usd, stats.cost_eur,
+    )
+    return SearchResult(fresh, stats)

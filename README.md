@@ -31,6 +31,9 @@ The bot's interface and messages are in Italian.
    then company type (communication agencies → mid-size/large companies → consulting firms), then match.
 6. **No duplicates**: offers already sent are never repeated. Tap 👎 to dismiss an offer
    (later searches avoid similar ones), or ⭐ to save it.
+7. **Selection report**: the first message of each delivery, above the list of offers, summarizes the
+   work done: sources read and how many postings each gave, how many were dropped and why, time and
+   cost per phase, and the totals for time, tokens and cost (in $ and €).
 
 ## Setup
 
@@ -86,14 +89,19 @@ search fees (up to `WEB_SEARCH_MAX_USES` searches, $10 per 1,000) and the tokens
 it reads, which make up most of its cost. Prompt caching is enabled: each internal step of the
 search re-reads the earlier context from the cache at 10% of the price.
 
-Measured with Opus 5.5: about $0.15 to assess the structured sources and about $0.32 for the
-web search, roughly $0.50 per run in total (~$15/month with one delivery a day). To spend less:
+Measured with Opus 5.5 on one full run: $0.84 (about 0.77 €), of which about $0.16 to assess the
+structured sources, $0.64 for the web search and $0.04 for the data extraction. That is about
+$25/month with one delivery a day; the web search varies a lot with how many pages it opens
+(earlier runs cost $0.4–0.5). To spend less:
 
-- `WEB_SEARCH_ENABLED=false` (structured sources only, ~$0.15 per run, ~$5/month);
+- `WEB_SEARCH_ENABLED=false` (structured sources only, ~$0.16 per run, ~$5/month);
 - `CLAUDE_MODEL=claude-sonnet-5-5` in `.env` (roughly half the price);
 - lower `WEB_SEARCH_MAX_USES` (e.g. 5).
 
-The usage of each run is in the logs (`input`, `cache_write`, `cache_read`, `output`) and in the Anthropic Console.
+You don't have to estimate: every delivery reports its own time, tokens and cost (see "Selection
+report" above). Costs are computed from the list prices in `src/fa_bot/stats.py`, and euros use the
+fixed exchange rate in `USD_EUR_RATE` (default 0.92), so treat them as estimates; the Anthropic
+Console has the exact bill.
 
 ## Development
 
@@ -110,4 +118,5 @@ uv run python scripts/debug_search.py
 
 Layout: `src/fa_bot/` contains `bot.py` (Telegram), `sources.py` (feeds and APIs),
 `scoring.py` (Claude assessment of postings), `search.py` (web search, filters and sorting),
+`stats.py` (time, token and cost accounting),
 `cv.py` (CV analysis), `db.py` (SQLite in `data/`), `formatting.py` (messages) and `models.py`.

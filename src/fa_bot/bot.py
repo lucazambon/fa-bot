@@ -96,22 +96,27 @@ async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
     async with lock:
         status = await app.bot.send_message(chat_id, "🔎 Sto cercando nuove offerte freelance… (può richiedere qualche minuto)")
         try:
-            jobs = await find_jobs(
+            result = await find_jobs(
                 app.bot_data["claude"], store, settings.claude_model, settings.web_search_max_uses,
                 fetch_max_uses=settings.web_fetch_max_uses,
                 web_search=settings.web_search_enabled,
                 debug_dir=settings.db_path.parent,
+                usd_eur=settings.usd_eur_rate,
             )
         except Exception as exc:  # noqa: BLE001 - l'errore va mostrato all'utente
             log.exception("Ricerca fallita")
             await status.edit_text(f"❌ Ricerca non riuscita: {exc}", parse_mode=None)
             return
 
+        jobs = result.jobs
+        summary = fmt.run_summary(result.stats)
         if not jobs:
-            await status.edit_text("😶 Nessuna nuova offerta compatibile in questo giro.")
+            await status.edit_text("😶 Nessuna nuova offerta compatibile in questo giro.\n\n" + summary)
             return
 
-        await status.edit_text(f"✨ <b>{len(jobs)} nuove offerte</b> compatibili con il tuo profilo:")
+        await status.edit_text(
+            f"✨ <b>{len(jobs)} nuove offerte</b> compatibili con il tuo profilo:\n\n{summary}"
+        )
         rate_min, rate_max = store.get("rate_min"), store.get("rate_max")
         for i, (key, job) in enumerate(jobs, start=1):
             store.add_sent(key, job)

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .models import Area, CompanyType, DurationType, Job, WorkMode
 from .sources import Posting
+from .stats import RunStats
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ async def assess_postings(
     rate_min: int,
     rate_max: int,
     preferences: list[str],
+    stats: RunStats | None = None,
 ) -> list[Job]:
     if not postings:
         return []
@@ -97,13 +99,16 @@ async def assess_postings(
         preferences=("Indicazioni del candidato:\n" + "\n".join(f"- {p}" for p in preferences)) if preferences else "",
         postings="\n\n".join(_posting_block(i, p) for i, p in enumerate(postings)),
     )
-    response = await client.messages.parse(
-        model=model,
-        max_tokens=16000,
-        output_config={"effort": "low"},
-        messages=[{"role": "user", "content": prompt}],
-        output_format=Assessments,
-    )
+    stats = stats or RunStats()
+    with stats.phase("Valutazione annunci", model) as ph:
+        response = await client.messages.parse(
+            model=model,
+            max_tokens=16000,
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": prompt}],
+            output_format=Assessments,
+        )
+        ph.add_usage(response.usage)
     log.info(
         "Valutazione: %d annunci, input=%d output=%d",
         len(postings), response.usage.input_tokens, response.usage.output_tokens,
@@ -118,6 +123,7 @@ async def assess_postings(
             continue
         p = postings[a.candidate_id]
         if not a.is_freelance:
+            stats.counts["not_freelance"] += 1
             log.info("  non freelance: %s — %s", p.title, p.company)
             continue
         jobs.append(

@@ -10,6 +10,7 @@ import docx
 from anthropic import AsyncAnthropic
 
 from .models import Profile
+from .stats import RunStats
 
 SUPPORTED = (".docx", ".pdf", ".txt", ".md")
 
@@ -59,6 +60,7 @@ async def build_profile(
     model: str,
     cv_content: list[dict[str, Any]],
     preferences: list[str],
+    stats: RunStats | None = None,
 ) -> Profile:
     extra = ""
     if preferences:
@@ -67,7 +69,7 @@ async def build_profile(
             "\n\nIl candidato ha aggiunto queste indicazioni, che hanno la precedenza sul CV:\n"
             f"<preferenze>\n{notes}\n</preferenze>"
         )
-    response = await client.messages.parse(
+    request = dict(
         model=model,
         max_tokens=16000,
         output_config={"effort": "medium"},
@@ -79,6 +81,12 @@ async def build_profile(
         ],
         output_format=Profile,
     )
+    if stats is None:
+        response = await client.messages.parse(**request)
+    else:
+        with stats.phase("Analisi CV", model) as ph:
+            response = await client.messages.parse(**request)
+            ph.add_usage(response.usage)
     if response.stop_reason == "refusal" or response.parsed_output is None:
         raise RuntimeError("Non sono riuscito ad analizzare il CV. Riprova o usa un altro formato.")
     return response.parsed_output

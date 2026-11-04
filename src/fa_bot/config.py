@@ -32,6 +32,7 @@ class Settings:
     web_search_max_uses: int
     web_fetch_max_uses: int
     web_search_enabled: bool
+    usd_eur_rate: float
     timezone: ZoneInfo
     db_path: Path
 
@@ -55,6 +56,7 @@ def load_settings() -> Settings:
         web_search_max_uses=int(os.getenv("WEB_SEARCH_MAX_USES", "8")),
         web_fetch_max_uses=int(os.getenv("WEB_FETCH_MAX_USES", "10")),
         web_search_enabled=os.getenv("WEB_SEARCH_ENABLED", "true").strip().lower() in ("1", "true", "si", "sì", "yes"),
+        usd_eur_rate=float(os.getenv("USD_EUR_RATE", "0.92")),
         timezone=ZoneInfo(os.getenv("TIMEZONE", "Europe/Rome")),
         db_path=db_path,
     )
