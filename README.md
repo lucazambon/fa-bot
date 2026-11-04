@@ -1,7 +1,7 @@
 # Freelance Careers Advisor (fa-bot)
 
 A personal Telegram bot that searches the web for freelance job offers matching your CV
-and sends them to you at the times you choose (by default once a day, at 9:00).
+and sends you a recap at the interval you choose (by default every 3 days, to keep costs low).
 
 The bot's interface and messages are in Italian.
 
@@ -64,8 +64,8 @@ The bot's interface and messages are in Italian.
 
 The bot starts at login and restarts on its own if it stops. The application log is in
 `logs/fa_bot.log`, and launchd's output goes to `logs/bot.log`.
-If the Mac is asleep at a scheduled time, the run is caught up if it wakes within an hour;
-otherwise it is skipped. To uninstall: `./scripts/uninstall-launchd.sh`.
+The schedule is saved on disk, so restarting the bot does not reset it. If the Mac is asleep when a
+recap is due, it is sent shortly after the Mac wakes up. To uninstall: `./scripts/uninstall-launchd.sh`.
 
 ## Commands
 
@@ -73,7 +73,7 @@ otherwise it is skipped. To uninstall: `./scripts/uninstall-launchd.sh`.
 |---|---|
 | `/start` | Initial setup |
 | `/cerca` | Search now |
-| `/orari [9 14 18]` | Show or change the delivery times |
+| `/frequenza [36h \| 3d]` | Show or change how often the recap is sent, in hours or days (alias: `/orari`) |
 | `/rate [250 300]` | Show or change the target daily rate |
 | `/cv` | Show the extracted profile. Send a new file to update it |
 | `/preferenze <text>` | Add a guideline (e.g. "anche ruoli da Scrum Master") |
@@ -91,7 +91,7 @@ search re-reads the earlier context from the cache at 10% of the price.
 
 Measured with Opus 5.5 on one full run: $0.84 (about 0.77 €), of which about $0.16 to assess the
 structured sources, $0.64 for the web search and $0.04 for the data extraction. That is about
-$25/month with one delivery a day; the web search varies a lot with how many pages it opens
+$25/month with one run a day and about $8/month at the default of one run every 3 days; the web search varies a lot with how many pages it opens
 (earlier runs cost $0.4–0.5). To spend less:
 
 - `WEB_SEARCH_ENABLED=false` (structured sources only, ~$0.16 per run, ~$5/month);

@@ -12,7 +12,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Requisiti di default (modificabili dal bot con /rate e /preferenze)
-DEFAULT_TIMES = ["09:00"]
+# Un giro di ricerca costa circa 0,8 €: di default se ne fa uno ogni 3 giorni.
+DEFAULT_INTERVAL_HOURS = 72
+MIN_INTERVAL_HOURS = 1
+MAX_INTERVAL_HOURS = 24 * 30
+RETRY_SECONDS = 3600  # dopo un invio fallito si riprova dopo un'ora
 DEFAULT_RATE_MIN = 250
 DEFAULT_RATE_MAX = 300
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from html import escape
 
-from .config import MIN_MATCH_SCORE
+from .config import MAX_INTERVAL_HOURS, MIN_INTERVAL_HOURS, MIN_MATCH_SCORE
 from .models import Job, Profile
 from .stats import RunStats
 
@@ -19,22 +19,33 @@ COMPANY_LABEL = {
     "altro": "Altro",
 }
 
-TIME_RE = re.compile(r"^([01]?\d|2[0-3])[:.]([0-5]\d)$|^([01]?\d|2[0-3])$")
+INTERVAL_RE = re.compile(r"^(\d+)(h|ore|ora|o|d|g|gg|giorni|giorno)?$")
+DAYS = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
+MONTHS = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"]
 
 
-def parse_times(args: list[str]) -> list[str]:
-    """'9 14:30 18.00' -> ['09:00', '14:30', '18:00']. Solleva ValueError se un orario non è valido."""
-    out = set()
-    for raw in " ".join(args).replace(",", " ").split():
-        m = TIME_RE.match(raw.strip())
-        if not m:
-            raise ValueError(raw)
-        if m.group(3) is not None:
-            h, mnt = int(m.group(3)), 0
-        else:
-            h, mnt = int(m.group(1)), int(m.group(2))
-        out.add(f"{h:02d}:{mnt:02d}")
-    return sorted(out)
+def parse_interval(args: list[str]) -> int:
+    """'36', '36h', '36 ore' -> 36; '3d', '3 giorni' -> 72. Solleva ValueError se non è valido."""
+    raw = "".join(args).strip().lower()
+    m = INTERVAL_RE.match(raw)
+    if not m:
+        raise ValueError(raw)
+    number, unit = int(m.group(1)), m.group(2) or "h"
+    hours = number * 24 if unit[0] in "dg" else number
+    if not MIN_INTERVAL_HOURS <= hours <= MAX_INTERVAL_HOURS:
+        raise ValueError(raw)
+    return hours
+
+
+def fmt_interval(hours: int) -> str:
+    if hours % 24 == 0:
+        days = hours // 24
+        return f"{hours} ore ({days} {'giorno' if days == 1 else 'giorni'})"
+    return "1 ora" if hours == 1 else f"{hours} ore"
+
+
+def fmt_when(dt) -> str:
+    return f"{DAYS[dt.weekday()]} {dt.day} {MONTHS[dt.month - 1]}, {dt:%H:%M}"
 
 
 def rate_label(job: Job, rate_min: int, rate_max: int) -> str:
@@ -179,7 +190,7 @@ HELP = """\
 <b>Freelance Careers Advisor</b>
 
 /cerca — avvia subito una ricerca
-/orari — mostra gli orari di invio · <code>/orari 9 14 18</code> per cambiarli
+/frequenza — ogni quante ore inviare il recap · <code>/frequenza 36</code> o <code>/frequenza 3d</code> per cambiarla
 /rate — mostra il rate · <code>/rate 250 300</code> per cambiarlo
 /cv — mostra il profilo estratto dal CV · invia un nuovo file per aggiornarlo
 /preferenze <i>testo</i> — aggiungi un'indicazione (es. <code>/preferenze anche ruoli da Scrum Master</code>)

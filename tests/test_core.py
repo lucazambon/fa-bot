@@ -1,7 +1,7 @@
 import pytest
 
 from fa_bot.db import Store, job_key
-from fa_bot.formatting import job_message, parse_times, rate_label
+from fa_bot.formatting import fmt_interval, job_message, parse_interval, rate_label
 from fa_bot.models import Job
 from fa_bot.search import filter_and_sort
 
@@ -30,11 +30,23 @@ def make_job(**kw) -> Job:
     return Job(**base)
 
 
-def test_parse_times():
-    assert parse_times(["9", "14:30", "18.00"]) == ["09:00", "14:30", "18:00"]
-    assert parse_times(["18,9"]) == ["09:00", "18:00"]
-    with pytest.raises(ValueError):
-        parse_times(["25:00"])
+def test_parse_interval():
+    assert parse_interval(["12"]) == 12
+    assert parse_interval(["36h"]) == 36
+    assert parse_interval(["36", "ore"]) == 36
+    assert parse_interval(["3d"]) == 72
+    assert parse_interval(["2", "giorni"]) == 48
+    assert parse_interval(["1g"]) == 24
+    for bad in (["0"], ["721"], ["abc"], [], ["12x"], ["-5"], ["31d"]):
+        with pytest.raises(ValueError):
+            parse_interval(bad)
+
+
+def test_fmt_interval():
+    assert fmt_interval(1) == "1 ora"
+    assert fmt_interval(36) == "36 ore"
+    assert fmt_interval(24) == "24 ore (1 giorno)"
+    assert fmt_interval(72) == "72 ore (3 giorni)"
 
 
 def test_filter_and_sort_priorities():
@@ -72,5 +84,5 @@ def test_store_dedup_and_status(tmp_path):
     assert store.is_known(key)
     store.set_status(key, "saved")
     assert store.jobs_by_status("saved")[0].title == "React Developer"
-    store.set("times", ["09:00"])
-    assert store.get("times") == ["09:00"]
+    store.set("interval_hours", 72)
+    assert store.get("interval_hours") == 72

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from datetime import time
+import time
+from datetime import datetime
 
 from anthropic import AsyncAnthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
@@ -21,13 +22,20 @@ from telegram.ext import (
 )
 
 from . import formatting as fmt
-from .config import DEFAULT_RATE_MAX, DEFAULT_RATE_MIN, DEFAULT_TIMES, Settings
+from .config import (
+    DEFAULT_INTERVAL_HOURS,
+    DEFAULT_RATE_MAX,
+    DEFAULT_RATE_MIN,
+    RETRY_SECONDS,
+    Settings,
+)
 from .cv import SUPPORTED, build_profile, cv_to_content
 from .db import Store
 from .search import find_jobs
 
 log = logging.getLogger(__name__)
-JOB_PREFIX = "digest-"
+JOB_NAME = "digest"
+STARTUP_DELAY = 30  # secondi: un invio già scaduto parte poco dopo l'avvio
 
 
 # --- helper ---------------------------------------------------------------
@@ -62,28 +70,69 @@ def owner_only(handler):
     return wrapper
 
 
-def schedule_digests(app: Application) -> list[str]:
+def interval_hours(store: Store) -> int:
+    return store.get("interval_hours", DEFAULT_INTERVAL_HOURS)
+
+
+def cycle_delay(last_run: float, hours: int, now: float) -> float:
+    """Secondi al prossimo invio: `hours` ore dopo l'ultimo; se è già scaduto, poco dopo l'avvio."""
+    return max(last_run + hours * 3600 - now, STARTUP_DELAY)
+
+
+def schedule_digests(app: Application, delay: float | None = None) -> datetime | None:
+    """(Ri)programma il prossimo invio. Un solo invio è in attesa alla volta: ogni giro programma il successivo.
+
+    Il punto di partenza del ciclo è `last_run`, salvato su disco: un riavvio del bot non lo azzera.
+    Restituisce quando partirà il prossimo invio, o None se gli invii sono in pausa.
+    """
     store: Store = app.bot_data["store"]
-    tz = app.bot_data["settings"].timezone
-    for job in app.job_queue.jobs():
-        if job.name and job.name.startswith(JOB_PREFIX):
-            job.schedule_removal()
-    times = store.get("times", DEFAULT_TIMES)
+    for job in app.job_queue.get_jobs_by_name(JOB_NAME):
+        job.schedule_removal()
+    app.bot_data["next_run"] = None
     if store.get("paused", False):
-        return times
-    for t in times:
-        h, m = map(int, t.split(":"))
-        app.job_queue.run_daily(
-            scheduled_digest,
-            time=time(h, m, tzinfo=tz),
-            name=JOB_PREFIX + t,
-            # Se il Mac era in stop all'orario previsto, recupera l'invio entro un'ora.
-            job_kwargs={"misfire_grace_time": 3600, "coalesce": True},
-        )
-    return times
+        return None
+    now = time.time()
+    if store.get("last_run") is None:
+        store.set("last_run", now)  # primo avvio: il ciclo parte da adesso
+    if delay is None:
+        delay = cycle_delay(store.get("last_run"), interval_hours(store), now)
+    app.job_queue.run_once(
+        scheduled_digest,
+        when=delay,
+        name=JOB_NAME,
+        # Se il Mac dorme quando scade, l'invio parte al risveglio invece di saltare.
+        job_kwargs={"misfire_grace_time": None},
+    )
+    next_run = datetime.fromtimestamp(now + delay, app.bot_data["settings"].timezone)
+    app.bot_data["next_run"] = next_run
+    return next_run
 
 
-async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
+def restart_cycle(app: Application) -> datetime | None:
+    """Fa ripartire il ciclo da adesso (nuova frequenza o ripresa dopo una pausa)."""
+    app.bot_data["store"].set("last_run", time.time())
+    return schedule_digests(app)
+
+
+def cost_estimate(store: Store) -> str:
+    """Costo mensile stimato alla frequenza attuale, in base all'ultimo giro."""
+    last = store.get("last_cost_eur")
+    if not last:
+        return ""
+    monthly = last * (24 * 30 / interval_hours(store))
+    return f"💶 Costo stimato: circa {fmt.fmt_eur(monthly)} al mese (ultimo giro: {fmt.fmt_eur(last)})"
+
+
+def schedule_text(app: Application) -> str:
+    store: Store = app.bot_data["store"]
+    if store.get("paused"):
+        return "⏸ Invii automatici in pausa (usa /riprendi)."
+    next_run = app.bot_data.get("next_run")
+    return "📅 Prossimo invio: " + (fmt.fmt_when(next_run) if next_run else "da programmare")
+
+
+async def _digest(app: Application, chat_id: int, manual: bool) -> str:
+    """Un giro di ricerca. Esito: "done", "error" o "busy" (ce n'è già uno in corso)."""
     store: Store = app.bot_data["store"]
     settings: Settings = app.bot_data["settings"]
     lock: asyncio.Lock = app.bot_data["search_lock"]
@@ -91,7 +140,7 @@ async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
     if lock.locked():
         if manual:
             await app.bot.send_message(chat_id, "⏳ C'è già una ricerca in corso, attendi qualche minuto.")
-        return
+        return "busy"
 
     async with lock:
         status = await app.bot.send_message(chat_id, "🔎 Sto cercando nuove offerte freelance… (può richiedere qualche minuto)")
@@ -106,13 +155,14 @@ async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
         except Exception as exc:  # noqa: BLE001 - l'errore va mostrato all'utente
             log.exception("Ricerca fallita")
             await status.edit_text(f"❌ Ricerca non riuscita: {exc}", parse_mode=None)
-            return
+            return "error"
 
+        store.set("last_cost_eur", round(result.stats.cost_eur, 4))
         jobs = result.jobs
         summary = fmt.run_summary(result.stats)
         if not jobs:
             await status.edit_text("😶 Nessuna nuova offerta compatibile in questo giro.\n\n" + summary)
-            return
+            return "done"
 
         await status.edit_text(
             f"✨ <b>{len(jobs)} nuove offerte</b> compatibili con il tuo profilo:\n\n{summary}"
@@ -127,12 +177,27 @@ async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
                 ]]
             )
             await app.bot.send_message(chat_id, fmt.job_message(i, job, rate_min, rate_max), reply_markup=keyboard)
+    return "done"
+
+
+async def run_digest(app: Application, chat_id: int, manual: bool) -> None:
+    """Esegue un giro e programma il successivo: ogni invio fa ripartire il ciclo, anche se lanciato a mano."""
+    outcome = await _digest(app, chat_id, manual)
+    store: Store = app.bot_data["store"]
+    if outcome == "done":
+        store.set("last_run", time.time())
+        schedule_digests(app)
+    elif not manual:
+        # Invio automatico fallito o rimandato: si riprova tra poco, senza aspettare un altro intero ciclo.
+        schedule_digests(app, delay=RETRY_SECONDS)
 
 
 async def scheduled_digest(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = _store(ctx).get("chat_id")
     if chat_id and _store(ctx).get_profile():
         await run_digest(ctx.application, chat_id, manual=False)
+    else:
+        schedule_digests(ctx.application, delay=RETRY_SECONDS)  # CV o chat non ancora configurati
 
 
 # --- comandi --------------------------------------------------------------
@@ -149,12 +214,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     store.set("chat_id", update.effective_chat.id)
-    times = schedule_digests(ctx.application)
+    schedule_digests(ctx.application)
     text = (
         f"Ciao {user.first_name}! 👋\n"
         "Sono il tuo <b>Freelance Careers Advisor</b>: cerco in rete offerte freelance compatibili "
-        "con il tuo CV e te le mando ogni giorno.\n\n"
-        f"🕘 Invii programmati: {', '.join(times)}\n"
+        "con il tuo CV e te le mando in automatico.\n\n"
+        f"🕘 Frequenza: ogni {fmt.fmt_interval(interval_hours(store))}\n"
         f"💶 Rate target: {store.get('rate_min')}–{store.get('rate_max')} €/giorno\n\n"
     )
     if store.get_profile() is None:
@@ -178,26 +243,27 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @owner_only
-async def cmd_times(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_frequency(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     store = _store(ctx)
     if ctx.args:
         try:
-            times = fmt.parse_times(ctx.args)
-        except ValueError as bad:
-            await update.message.reply_text(f"Orario non valido: <code>{bad}</code>. Esempio: <code>/orari 9 14:30 18</code>")
+            hours = fmt.parse_interval(ctx.args)
+        except ValueError:
+            await update.message.reply_text(
+                "Frequenza non valida. Indica ogni quante ore (da 1 a 720) o giorni:\n"
+                "<code>/frequenza 12</code> · <code>/frequenza 36h</code> · <code>/frequenza 3d</code>"
+            )
             return
-        if not times or len(times) > 8:
-            await update.message.reply_text("Indica da 1 a 8 orari.")
-            return
-        store.set("times", times)
-        schedule_digests(ctx.application)
-        await update.message.reply_text(f"✅ Nuovi orari di invio: {', '.join(times)}")
+        store.set("interval_hours", hours)
+        restart_cycle(ctx.application)
+        head = f"✅ Il recap arriverà ogni {fmt.fmt_interval(hours)}."
     else:
-        paused = " (in pausa)" if store.get("paused") else ""
-        await update.message.reply_text(
-            f"🕘 Orari di invio{paused}: {', '.join(store.get('times', DEFAULT_TIMES))}\n"
-            "Per cambiarli: <code>/orari 9 14 18</code>"
+        head = (
+            f"🕘 Il recap arriva ogni {fmt.fmt_interval(interval_hours(store))}.\n"
+            "Per cambiarlo: <code>/frequenza 36</code> (ore) o <code>/frequenza 3d</code> (giorni)."
         )
+    lines = [head, schedule_text(ctx.application), cost_estimate(store)]
+    await update.message.reply_text("\n".join(x for x in lines if x))
 
 
 @owner_only
@@ -316,7 +382,7 @@ async def cmd_filters(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Rate: {store.get('rate_min')}–{store.get('rate_max')} €/giorno (mostrate anche le offerte senza rate)\n"
         "• Durata: brevi → lunghe → medie\n"
         "• Aziende: agenzie di comunicazione → medie/grandi imprese → consulenza\n"
-        f"• Orari: {', '.join(store.get('times', DEFAULT_TIMES))}"
+        f"• Frequenza: ogni {fmt.fmt_interval(interval_hours(store))}"
     )
     if prefs:
         text += "\n\n<b>Tue indicazioni</b>\n" + "\n".join(f"• {p}" for p in prefs)
@@ -345,8 +411,11 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @owner_only
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _store(ctx).set("paused", False)
-    times = schedule_digests(ctx.application)
-    await update.message.reply_text(f"▶️ Invii automatici riattivati: {', '.join(times)}")
+    restart_cycle(ctx.application)
+    await update.message.reply_text(
+        f"▶️ Invii automatici riattivati, ogni {fmt.fmt_interval(interval_hours(_store(ctx)))}.\n"
+        + schedule_text(ctx.application)
+    )
 
 
 @owner_only
@@ -379,13 +448,16 @@ async def _post_init(app: Application) -> None:
     if store.get("rate_min") is None:
         store.set("rate_min", DEFAULT_RATE_MIN)
         store.set("rate_max", DEFAULT_RATE_MAX)
-    if store.get("times") is None:
-        store.set("times", DEFAULT_TIMES)
-    times = schedule_digests(app)
-    log.info("Invii programmati: %s", times)
+    if store.get("interval_hours") is None:
+        store.set("interval_hours", DEFAULT_INTERVAL_HOURS)
+    next_run = schedule_digests(app)
+    log.info(
+        "Recap ogni %d ore, prossimo invio: %s",
+        interval_hours(store), next_run.isoformat(timespec="minutes") if next_run else "in pausa",
+    )
     await app.bot.set_my_commands([
         ("cerca", "Cerca subito nuove offerte"),
-        ("orari", "Mostra o cambia gli orari di invio"),
+        ("frequenza", "Ogni quante ore inviare il recap"),
         ("rate", "Mostra o cambia il rate giornaliero"),
         ("cv", "Mostra il profilo estratto dal CV"),
         ("preferenze", "Aggiungi un'indicazione per la ricerca"),
@@ -413,7 +485,7 @@ def build_app(settings: Settings) -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cerca", cmd_search))
-    app.add_handler(CommandHandler("orari", cmd_times))
+    app.add_handler(CommandHandler(["frequenza", "orari"], cmd_frequency))
     app.add_handler(CommandHandler("rate", cmd_rate))
     app.add_handler(CommandHandler("cv", cmd_cv))
     app.add_handler(CommandHandler("preferenze", cmd_preferences))
